@@ -31,7 +31,6 @@ You can send a prompt in a few ways:
     ```
 
 3.  **From a file (`-f` or `--file`):**
-    First, create a prompt file:
 
     ```bash
     echo "Summarize the key points of the paper Attention Is All You Need." > summary.txt
