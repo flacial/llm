@@ -1,0 +1,6 @@
+# Stores the compiled binaries of the Go program
+bin
+
+# Temp dirs
+scratch
+temp

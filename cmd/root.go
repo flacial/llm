@@ -1,0 +1,546 @@
+package cmd
+
+import (
+	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/charmbracelet/glamour"
+	"github.com/flacial/llm/internal/llm"
+	"github.com/flacial/llm/internal/log"
+	"github.com/flacial/llm/internal/templating"
+	"github.com/flacial/llm/internal/utils"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	"golang.org/x/net/context"
+	"gopkg.in/yaml.v3"
+)
+
+//go:embed default-templates/*
+var defaultTemplates embed.FS
+
+// Flags
+var cfgFile string
+var modelFlag string
+var apiKeyFlag string
+var copyToClipboardFlag bool
+var promptFileFlag string
+var streamingModeFlag bool
+var formatOutputFlag bool
+var verboseFlag bool
+var logFileFlag string
+var debugMode bool
+var templateFlag string
+
+// It's a global variable to allow easy mocking in tests by direct assignment
+var httpClient llm.HTTPClient = &http.Client{
+	Timeout: llm.DefaultTimeout,
+}
+
+var rootCmd = &cobra.Command{
+	Use:   "llm [prompt] [flag]",
+	Short: "Text, file, and work with LLMs from your terminal!",
+	Long:  `llm is a CLI tool that allow you to chat with any LLM model on OpenRouter right from your sweet home (spoiler alert: the terminal)`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		log.Logger.Info().Msg("Starting llm")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		// Cancel all goroutines, on going response consuming, and so on after function exits
+		defer cancel()
+
+		signalChannel := make(chan os.Signal, 1)
+		signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
+
+		go func() {
+			<-signalChannel
+			log.Logger.Info().Msg("Stream interrupted. Cancelling...")
+			cancel()
+		}()
+
+		finalPrompt, err := getPromptContent(args, promptFileFlag)
+		if err != nil {
+			log.Logger.Error().Err(err).Msg("Failed to get prompt content")
+			return err
+		}
+
+		requestedModel := viper.GetString("model")
+		aliases := viper.GetStringMapString("models.aliases")
+
+		resolvedModel := requestedModel
+		if aliasToFull, found := aliases[requestedModel]; found {
+			resolvedModel = aliasToFull
+
+			if viper.GetBool("verbose") {
+				log.Logger.Info().Str("alias", requestedModel).Str("model", resolvedModel).Msg("Using alias for model.")
+			}
+		} else {
+			log.Logger.Info().Str("model", resolvedModel).Msg("Using model.")
+		}
+
+		apiKey := viper.GetString("api_key")
+		if apiKey == "" {
+			log.Logger.Fatal().Msg("API key not set. Please provide it via --api-key, environment variable (OPENROUTER_API_KEY), or in ~/.llmrc.yaml") // Fatal if we want to exit immediately
+			return errors.New("api key not set")
+		}
+
+		llmClient := llm.NewLLMClient(apiKey, httpClient, "")
+
+		// 1. Read the template file from templateFlag variable
+		// 2. Use text/template to fill the user_prompt_template
+		// 3. Append the system_prmopt to the llm completion request messages
+		// 4. Append the user message to the llm completion request
+		// 5. (Optional) Add the model and temperature of the completion
+
+		var completionMessages []llm.ChatCompletionMessage
+		var finalResolvedModel = resolvedModel
+		var finalTemperature *float64
+
+		if templateFlag != "" {
+			templateFilePath, err := getTemplateDirPath()
+			if err != nil {
+				log.Logger.Error().Err(err).Msg("Error getting template directory path")
+				return err
+			}
+
+			templateFilePathFinal := filepath.Join(templateFilePath, templateFlag+".tmpl.yaml")
+			templateFileBytes, err := os.ReadFile(templateFilePathFinal)
+			if err != nil {
+				log.Logger.Fatal().Err(err).Str("template_path", templateFilePath).Msg("Error reading template file.")
+				return err
+			}
+
+			var selectedTemplate templating.Template
+
+			err = yaml.Unmarshal(templateFileBytes, &selectedTemplate)
+			if err != nil {
+				log.Logger.Fatal().Err(err).Str("template_path", templateFilePath).Msg("Error unmarshalling template file. Check YAML syntax.")
+				return err
+			}
+
+			if selectedTemplate.SystemMessage != "" {
+				completionMessages = append(completionMessages, llm.ChatCompletionMessage{
+					Role:    "system",
+					Content: selectedTemplate.SystemMessage,
+				})
+			}
+
+			processedUserPrompt, err := selectedTemplate.ProcessUserPromptTemplate(finalPrompt)
+			if err != nil {
+				log.Logger.Fatal().Err(err).Str("template_path", templateFilePath).Msg("Error processing user prompt template.")
+				return err
+			}
+
+			completionMessages = append(completionMessages, llm.ChatCompletionMessage{
+				Role:    "user",
+				Content: processedUserPrompt,
+			})
+			log.Logger.Debug().Msg("Appended processed user prompt from template.")
+
+			if selectedTemplate.Model != "" {
+				finalResolvedModel = selectedTemplate.Model
+				log.Logger.Debug().Str("model", finalResolvedModel).Msg("Overriding model from template.")
+			}
+
+			if selectedTemplate.Temperature != nil {
+				finalTemperature = selectedTemplate.Temperature
+				log.Logger.Debug().Float64("temperature", *finalTemperature).Msg("Overriding temperature from template.")
+			}
+
+		} else {
+			completionMessages = append(completionMessages, llm.ChatCompletionMessage{
+				Role:    "user",
+				Content: finalPrompt,
+			})
+			log.Logger.Debug().Msg("No template used. Using direct user prompt.")
+		}
+
+		completionBody := llm.ChatCompletionRequest{
+			Model:       finalResolvedModel,
+			Messages:    completionMessages,
+			Temperature: finalTemperature,
+		}
+
+		if !streamingModeFlag || viper.GetBool("always_format") {
+			completion, err := llmClient.GetChatCompletion(ctx, completionBody)
+			if err != nil {
+				log.Logger.Error().Err(err).Msg("Error getting chat completion")
+				return err
+			}
+
+			if len(completion.Choices) > 0 {
+				completionContent := completion.Choices[0].Message.Content
+
+				// TODO: Allow configuring the code theme/stylesheet
+				// Give the output a glammm 💅
+				renderedOutput, renderErr := glamour.Render(completionContent, "auto")
+				if renderErr != nil {
+					log.Logger.Error().Err(renderErr).Msg("Error rendering output.")
+				} else {
+					fmt.Println(renderedOutput)
+				}
+
+				if viper.GetBool("always_copy") {
+					log.Logger.Info().Msg("Copying to clipboard...")
+					err := utils.CopyToClipboard(completion.Choices[0].Message.Content)
+					if err != nil {
+						log.Logger.Warn().Err(err).Msg("Error copying to clipboard")
+					}
+				}
+			} else {
+				log.Logger.Warn().Msg("OpenRouter responded with no choices!")
+				return errors.New("no completion choices received")
+			}
+		} else {
+			completionBody.Stream = true
+			fullCompletion, err := llmClient.GetStreamingChatCompletion(ctx, completionBody, os.Stdout)
+			if err != nil {
+				log.Logger.Error().Err(err).Msg("Error getting streaming chat completion")
+				return err
+			}
+
+			if viper.GetBool("always_copy") {
+				log.Logger.Info().Msg("Copying to clipboard...")
+				err := utils.CopyToClipboard(fullCompletion)
+				if err != nil {
+					log.Logger.Warn().Err(err).Msg("Error copying to clipboard")
+				}
+			}
+		}
+
+		return nil
+	},
+	Args: func(cmd *cobra.Command, args []string) error {
+		return nil // Allow arbitrary arguments
+	},
+}
+
+type OpenRouterModelsResponse struct {
+	Data []OpenRouterModel `json:"data"`
+}
+
+type OpenRouterModel struct {
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	Created       int64             `json:"created"`
+	Description   string            `json:"description"`
+	ContextLength int               `json:"context_length"`
+	Architecture  ModelArchitecture `json:"architecture"`
+	Pricing       ModelPricing      `json:"pricing"`
+	TopProvider   ModelTopProvider  `json:"top_provider"`
+}
+
+type ModelArchitecture struct {
+	InputModalities  []string `json:"input_modalities"`
+	OutputModalities []string `json:"output_modalities"`
+	Tokenizer        string   `json:"tokenizer"`
+	InstructType     string   `json:"instruct_type"`
+}
+
+type ModelPricing struct {
+	Prompt            string `json:"prompt"`
+	Completion        string `json:"completion"`
+	Image             string `json:"image"`
+	Request           string `json:"request"`
+	InputCacheRead    string `json:"input_cache_read"`
+	InputCacheWrite   string `json:"input_cache_write"`
+	WebSearch         string `json:"web_search"`
+	InternalReasoning string `json:"internal_reasoning"`
+}
+
+type ModelTopProvider struct {
+	IsModerated bool `json:"is_moderated"`
+}
+
+var ModelsCmd = &cobra.Command{
+	Use:   "models",
+	Short: "List available LLM models from OpenRouter.ai",
+	Long:  `Fetches and displays a list of available LLM models and their details from the OpenRouter.ai API.`,
+	RunE:  runModelsCommand,
+}
+
+func runModelsCommand(cmd *cobra.Command, args []string) error {
+	apiKey := viper.GetString("api_key")
+	if apiKey == "" {
+		return fmt.Errorf("API key not set. Please set LLM_API_KEY environment variable or 'api_key' in config to query OpenRouter.ai models.")
+	}
+
+	openRouterAPIURL := "https://openrouter.ai/api/v1/models"
+
+	req, err := http.NewRequest("GET", openRouterAPIURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to make HTTP request to OpenRouter API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("OpenRouter API returned non-200 status: %d %s, Body: %s", resp.StatusCode, resp.Status, string(bodyBytes))
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var modelsResponse OpenRouterModelsResponse
+	err = json.Unmarshal(bodyBytes, &modelsResponse)
+	if err != nil {
+		return fmt.Errorf("failed to parse JSON response from OpenRouter API: %w", err)
+	}
+
+	if len(modelsResponse.Data) == 0 {
+		fmt.Println("No models found from openrouter.ai—AI took over and we're now doomed.")
+		return nil
+	}
+
+	fmt.Println("Available Models from openrouter.ai:")
+	fmt.Println("------------------------------------")
+	for _, model := range modelsResponse.Data {
+		fmt.Printf("ID: %s\n", model.ID)
+		fmt.Printf("Name: %s\n", model.Name)
+		fmt.Printf("Description: %s\n", truncateString(model.Description, 100)+"\n") // Truncate long descriptions
+		fmt.Printf("Context Length: %d tokens\n", model.ContextLength)
+		if model.Pricing.Prompt != "" {
+			fmt.Printf("Pricing (per 1M tokens): Input=$%s, Output=$%s\n",
+				model.Pricing.Prompt,
+				model.Pricing.Completion)
+		}
+		if len(model.Architecture.InputModalities) > 0 {
+			fmt.Printf("Input Modalities: %s\n", strings.Join(model.Architecture.InputModalities, ", "))
+		}
+		if model.TopProvider.IsModerated {
+			fmt.Println("Moderated: Yes")
+		} else {
+			fmt.Println("Moderated: No")
+		}
+
+		fmt.Printf("Added: %s\n", time.Unix(model.Created, 0).Format("2006-01-02"))
+		fmt.Println("------------------------------------")
+	}
+
+	return nil
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+func Execute() error {
+	rootCmd.AddCommand(ModelsCmd)
+	return rootCmd.Execute()
+}
+
+func init() {
+	cobra.OnInitialize(initConfig)
+	cobra.OnInitialize(initDefaultTemplates)
+	cobra.OnInitialize(func() {
+		log.InitLggger(viper.GetBool("verbose"), viper.GetBool("debug_mode"), viper.GetString("log_file"))
+	})
+
+	rootCmd.PersistentFlags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose output for debugging information.")
+	rootCmd.PersistentFlags().StringVar(&logFileFlag, "log-file", "", "Path to the log file (default: ~/.llm/logs/llm.log).")
+	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug logging level (overrides --verbose).")
+
+	viper.BindPFlag("verbose", rootCmd.PersistentFlags().Lookup("verbose"))
+	viper.BindPFlag("log_file", rootCmd.PersistentFlags().Lookup("log-file"))
+	viper.BindPFlag("debug_mode", rootCmd.PersistentFlags().Lookup("debug"))
+
+	// Store the config file in a variable if provided through a flag
+	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.llm.yaml)")
+
+	// Store "model" flag in a variable
+	rootCmd.Flags().StringVarP(&modelFlag, "model", "m", "", "Specify the LLM model to use (e.g., google/gemini-2.5-flash, fast, gf25)")
+	// Looking for "model" value from the flag first, then env variables, then config file, ..xetc
+	viper.BindPFlag("model", rootCmd.Flags().Lookup("model"))
+
+	// Store "api-key" flag in a variable
+	rootCmd.PersistentFlags().StringVarP(&apiKeyFlag, "api-key", "k", "", "Your LLM API key (overrides config/env)")
+	viper.BindPFlag("api_key", rootCmd.PersistentFlags().Lookup("api-key"))
+
+	rootCmd.Flags().BoolVarP(&copyToClipboardFlag, "copy", "c", false, "Copy the LLM response to the clipboard")
+	viper.BindPFlag("always_copy", rootCmd.Flags().Lookup("copy"))
+
+	rootCmd.Flags().StringVarP(&promptFileFlag, "prompt-file", "f", "", "Path to a file containing the prompt")
+
+	rootCmd.Flags().BoolVarP(&streamingModeFlag, "stream-mode", "s", true, "Show the LLM output in blocking style")
+	viper.BindPFlag("use_streaming", rootCmd.Flags().Lookup("stream-mode"))
+
+	rootCmd.Flags().BoolVarP(&formatOutputFlag, "format", "F", false, "Format the LLM output")
+	viper.BindPFlag("always_format", rootCmd.Flags().Lookup("format"))
+
+	rootCmd.Flags().StringVarP(&templateFlag, "template", "t", "", "Specify the template to use for the prompt")
+	viper.BindPFlag("template", rootCmd.Flags().Lookup("template"))
+}
+
+func initConfig() {
+	configPath := ""
+
+	if cfgFile != "" {
+		viper.SetConfigFile(cfgFile)
+		configPath = cfgFile
+	} else {
+		home, err := os.UserHomeDir()
+		cobra.CheckErr(err)
+
+		configPath = filepath.Join(home, ".llmrc.yaml")
+
+		viper.AddConfigPath(home)
+		viper.SetConfigType("yaml")
+		viper.SetConfigName(".llmrc")
+	}
+
+	// Any variables starting with LLM_* are captured for the cli
+	viper.SetEnvPrefix("LLM")
+
+	// Auto loads config files from env variables if any matches
+	viper.AutomaticEnv()
+
+	viper.BindPFlag("template", rootCmd.PersistentFlags().Lookup("template"))
+	viper.SetDefault("always_format", false)
+	viper.SetDefault("use_streaming", true)
+	viper.SetDefault("always_copy", false)
+	viper.SetDefault("api_key", "")
+	viper.SetDefault("model", "google/gemini-2.5-flash")
+	viper.SetDefault("verbose", false)
+	viper.SetDefault("debug_mode", false)
+	viper.SetDefault("log_file", "")
+	viper.SetDefault("models.aliases", map[string]string{
+		"fast":  "openai/gpt-4.1-nano",
+		"10x":   "anthropic/claude-sonnet-4",
+		"smart": "google/gemini-2.5-pro",
+		"gpt4":  "openai/gpt-4o",
+	})
+
+	if err := viper.ReadInConfig(); err == nil {
+		log.Logger.Info().Str("config_file", viper.ConfigFileUsed()).Msg("Using config file.")
+	} else {
+		// Check if file exists or not in the file system
+		if errors.Is(err, os.ErrNotExist) || (err != nil && strings.Contains(err.Error(), "Config File \"")) {
+			log.Logger.Info().Str("config_path", configPath).Msg("Config file not found. Creating a new one with defaults...")
+
+			// Attempt to write the default config file
+			if writeErr := viper.SafeWriteConfigAs(configPath); writeErr != nil {
+				log.Logger.Error().Err(writeErr).Str("config_path", configPath).Msg("Error creating default config file.")
+			} else {
+				log.Logger.Info().Str("config_path", configPath).Msg("Default config file created.")
+			}
+
+			// Re-read config file
+			if err := viper.ReadInConfig(); err != nil {
+				log.Logger.Error().Err(err).Msg("Error reading newly created config file.")
+			}
+
+		} else {
+			// Some unknown system error
+			log.Logger.Error().Err(err).Msg("Error reading config file.")
+			os.Exit(1)
+		}
+	}
+}
+
+func initDefaultTemplates() {
+	templateDirPath, err := getTemplateDirPath()
+	if err != nil {
+		log.Logger.Error().Err(err).Msg("Failed to get template directory path.")
+		return
+	}
+
+	entries, err := os.ReadDir(templateDirPath)
+	if err != nil && !os.IsNotExist(err) {
+		log.Logger.Error().Err(err).Str("path", templateDirPath).Msg("Failed to read template directory.")
+		return
+	}
+
+	hasTemplates := false
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".yaml") {
+			hasTemplates = true
+			break
+		}
+	}
+
+	if hasTemplates {
+		log.Logger.Debug().Str("path", templateDirPath).Msg("Default templates already exist or custom templates are present. Skipping auto-initialization.")
+		// Templates already exist.
+		return
+	}
+
+	log.Logger.Info().Str("path", templateDirPath).Msg("Template directory is empty or missing. Initializing with default templates...")
+
+	// Create the directory if it doesn't exist
+	if err := os.MkdirAll(templateDirPath, 0755); err != nil {
+		log.Logger.Error().Err(err).Str("path", templateDirPath).Msg("Failed to create template directory for defaults.")
+		return
+	}
+
+	// Copy embedded templates
+	fs.WalkDir(defaultTemplates, "default-templates", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip directories
+		if d.IsDir() {
+			return nil
+		}
+
+		relPath := strings.TrimPrefix(path, "default-templates/")
+		destPath := filepath.Join(templateDirPath, relPath)
+
+		sourceFile, err := defaultTemplates.Open(path)
+		if err != nil {
+			log.Logger.Error().Err(err).Str("source", path).Msg("Failed to open embedded template file.")
+			// Continue even if there's an error
+			return nil
+		}
+		defer sourceFile.Close()
+
+		destFile, err := os.Create(destPath)
+		if err != nil {
+			log.Logger.Error().Err(err).Str("dest", destPath).Msg("Failed to create destination template file.")
+			return nil
+		}
+		defer destFile.Close()
+
+		if _, err := io.Copy(destFile, sourceFile); err != nil {
+			log.Logger.Error().Err(err).Str("source", path).Str("dest", destPath).Msg("Failed to copy embedded template file.")
+			return nil
+		}
+
+		log.Logger.Debug().Str("template", relPath).Str("dest", destPath).Msg("Copied default template.")
+		return nil
+	})
+
+	log.Logger.Info().Msg("Default templates initialized successfully.")
+}
+
+func getTemplateDirPath() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Logger.Fatal().Err(err).Msg("Failed to get user home directory for templates.")
+		return "", err
+	}
+
+	return filepath.Join(homeDir, ".llm", "templates"), nil
+}

@@ -1,0 +1,12 @@
+name: "summarize"
+description: "Summarizes provided text concisely, extracting key information."
+system_message: |
+  You are a highly efficient summarization AI. Your task is to extract the most important information and key points from any given text, presenting it in a clear, concise, and easy-to-understand summary. Do not add any new information. Prioritize brevity without losing essential context.
+user_prompt_template: |
+  Please summarize the following text:
+
+  {{.UserPrompt}}
+
+# You could also add optional overrides here:
+# model: "google/gemini-1.5-flash"
+# temperature: 0.7
