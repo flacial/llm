@@ -131,6 +131,51 @@ export LLM_API_KEY="sk-or-..."
 llm "Hello!"
 ```
 
+### Shell Completion
+
+### Bash:
+
+To load completions for the current session:
+
+```bash
+$ source <(llm completion bash)
+```
+
+To load completions for each new session, execute this once:
+
+- **Linux:**
+  ```bash
+  $ llm completion bash > /etc/bash_completion.d/llm
+  ```
+- **macOS:**
+  ```bash
+  $ llm completion bash > /usr/local/etc/bash_completion.d/llm
+  ```
+
+### Zsh:
+
+To load completions for each session, execute this once:
+
+```bash
+$ llm completion zsh > ~/.zsh/_llm
+```
+
+Restart your terminal for it to work.
+
+### Fish:
+
+To load completions for the current session:
+
+```bash
+$ llm completion fish | source
+```
+
+To load completions for each new session, execute this once:
+
+```bash
+$ llm completion fish > ~/.config/fish/completions/llm.fish
+```
+
 ### Verbose Mode (`-v` or `--verbose`)
 
 See detailed output, including API requests and responses, useful for debugging.
