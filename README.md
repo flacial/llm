@@ -1,3 +1,5 @@
+<img src="https://github.com/user-attachments/assets/6eaaf692-91f9-4faa-bd0a-22513089c4f3" alt="llm-logo" style="width: 200px; height: 200px;">
+
 # llm
 
 **llm** provides a simple way to talk to LLMs available via OpenRouter right from many programmers home (_the terminal_).
