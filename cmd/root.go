@@ -223,7 +223,6 @@ var rootCmd = &cobra.Command{
 }
 
 func Execute() error {
-	rootCmd.AddCommand(ModelsCmd)
 	return rootCmd.Execute()
 }
 
