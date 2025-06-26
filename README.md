@@ -4,6 +4,23 @@
 
 **llm** provides a simple way to talk to LLMs available via OpenRouter right from many programmers home (_the terminal_).
 
+## Table of Contents
+
+- [Install](#install)
+- [Examples](#examples)
+  - [Basic Usage: Ask Anything](#basic-usage-ask-anything)
+  - [Model Selection (`-m` or `--model`)](#model-selection--m-or---model)
+  - [Model Listing](#model-listing)
+  - [Streaming Output](#streaming-output)
+  - [Clipboard Copy (`-C` or `--copy`)](#clipboard-copy--c-or---copy)
+  - [Templates (`-t` or `--template`)](#templates--t-or---template)
+  - [Configurable](#configurable)
+  - [API Keys](#api-keys)
+  - [Shell Completion](#shell-completion)
+  - [Verbose Mode (`-v` or `--verbose`)](#verbose-mode--v-or---verbose)
+- [Coming Soon](#coming-soon)
+- [Note](#note)
+
 ## Install
 
 Clone the repository and install the `llm` executable to your Go binary path (`(go env GOPATH)/bin`):
