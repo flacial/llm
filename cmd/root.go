@@ -243,6 +243,7 @@ func init() {
 
 	// Store the config file in a variable if provided through a flag
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.llm.yaml)")
+	viper.BindPFlag("config_file", rootCmd.PersistentFlags().Lookup("config"))
 
 	// Store "model" flag in a variable
 	rootCmd.Flags().StringVarP(&modelFlag, "model", "m", "", "Specify the LLM model to use (e.g., google/gemini-2.5-flash, fast, gf25)")
@@ -269,21 +270,21 @@ func init() {
 }
 
 func initConfig() {
-	configPath := ""
-
+	var configPath string
 	if cfgFile != "" {
-		viper.SetConfigFile(cfgFile)
 		configPath = cfgFile
 	} else {
-		home, err := os.UserHomeDir()
-		cobra.CheckErr(err)
-
-		configPath = filepath.Join(home, ".llmrc.yaml")
-
-		viper.AddConfigPath(home)
-		viper.SetConfigType("yaml")
-		viper.SetConfigName(".llmrc")
+		xdgConfigHome := os.Getenv("XDG_CONFIG_HOME")
+		if xdgConfigHome == "" {
+			home, err := os.UserHomeDir()
+			cobra.CheckErr(err)
+			xdgConfigHome = filepath.Join(home, ".config")
+		}
+		configPath = filepath.Join(xdgConfigHome, "llm", "config.yaml")
 	}
+
+	viper.SetConfigFile(configPath)
+	viper.SetConfigType("yaml")
 
 	// Any variables starting with LLM_* are captured for the cli
 	viper.SetEnvPrefix("LLM")
@@ -291,7 +292,6 @@ func initConfig() {
 	// Auto loads config files from env variables if any matches
 	viper.AutomaticEnv()
 
-	viper.BindPFlag("template", rootCmd.PersistentFlags().Lookup("template"))
 	viper.SetDefault("always_format", false)
 	viper.SetDefault("use_streaming", true)
 	viper.SetDefault("always_copy", false)
@@ -310,22 +310,24 @@ func initConfig() {
 	if err := viper.ReadInConfig(); err == nil {
 		log.Logger.Info().Str("config_file", viper.ConfigFileUsed()).Msg("Using config file.")
 	} else {
-		// Check if file exists or not in the file system
-		if errors.Is(err, os.ErrNotExist) || (err != nil && strings.Contains(err.Error(), "Config File \"")) {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
 			log.Logger.Info().Str("config_path", configPath).Msg("Config file not found. Creating a new one with defaults...")
 
 			// Attempt to write the default config file
+			if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+				log.Logger.Error().Err(err).Str("config_path", configPath).Msg("Error creating config directory.")
+				return
+			}
+
 			if writeErr := viper.SafeWriteConfigAs(configPath); writeErr != nil {
 				log.Logger.Error().Err(writeErr).Str("config_path", configPath).Msg("Error creating default config file.")
 			} else {
 				log.Logger.Info().Str("config_path", configPath).Msg("Default config file created.")
 			}
 
-			// Re-read config file
 			if err := viper.ReadInConfig(); err != nil {
 				log.Logger.Error().Err(err).Msg("Error reading newly created config file.")
 			}
-
 		} else {
 			// Some unknown system error
 			log.Logger.Error().Err(err).Msg("Error reading config file.")
