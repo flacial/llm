@@ -224,13 +224,6 @@ See detailed output, including API requests and responses, useful for debugging.
 llm -v "hello world" # For debugging use --debug
 ```
 
-## Coming Soon
-
-- Local model support
-- Clearer error messages
-- More tests
-- Easier to use models listing/filtering
-
 ## Note
 
 This is a personal tool. It works well, but isn't built for production workloads. Use at your own risk.
