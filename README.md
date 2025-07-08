@@ -123,19 +123,42 @@ llm "Vacation plans for going to paris" -t brainstorm
 
 ### Configurable
 
-Set a default model or other options in `~/.llmrc.yaml` so you don't have to specify them every time.
+Set a default model or other options in your configuration file so you don't have to specify them every time.
 
-**Setup:** Add a default model to your `~/.llmrc.yaml` file.
+**Configuration File Location:** The configuration file is located at `$XDG_CONFIG_HOME/llm/config.yaml` (typically `~/.config/llm/config.yaml` on most systems). If `XDG_CONFIG_HOME` is not set, it defaults to `~/.config`. You can also specify a custom location using the `--config` flag.
+
+**Setup:** Add a default model to your configuration file:
 
 ```yaml
-# ~/.llmrc.yaml
+# ~/.config/llm/config.yaml
 model: openai/gpt-3.5-turbo # This will be used if -m is not specified
+api_key: "your-api-key-here"  # Optional if using environment variable
 ```
 
-**Usage:** Now you can run `llm` without the `-m` flag.
+**Model Aliases:** You can use shorter aliases for commonly used models:
+
+```yaml
+# ~/.config/llm/config.yaml
+model: fast # Uses the built-in alias for openai/gpt-4.1-nano
+# Or define custom aliases:
+models:
+  aliases:
+    my-model: "anthropic/claude-3-5-sonnet"
+    quick: "google/gemini-flash-1.5"
+```
+
+**Built-in Aliases:**
+- `fast`: openai/gpt-4.1-nano
+- `10x`: anthropic/claude-sonnet-4
+- `smart`: google/gemini-2.5-pro
+- `gpt4`: openai/gpt-4o
+
+**Usage:** Now you can run `llm` without the `-m` flag:
 
 ```bash
 llm "What is the capital of Sudan?"
+# Or use an alias
+llm -m fast "Quick question here"
 ```
 
 ### API Keys
